@@ -320,6 +320,7 @@ vec3 evalVolumetricNEE(
 
   bool volumeFound = false;
   vec3 physicalFroxelUVW;
+  vec3 matchedVirtualFroxelUVW = vec3(0.5f);
 
   for (uint i = 0; i < volumeArgs.numActiveFroxelVolumes; ++i)
   {
@@ -339,12 +340,13 @@ vec3 evalVolumetricNEE(
   #ifndef VOLUME_LIGHTING_NO_JITTER
     virtualFroxelUVW = calculateJitteredFroxelUvw(volumeArgs, virtualFroxelUVW);
   #endif
-    
+
     if (all(virtualFroxelUVW > 0.0f) && all(virtualFroxelUVW < 1.0f))
     {
       physicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(
         virtualFroxelUVW, froxelVolume,
         volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
+      matchedVirtualFroxelUVW = virtualFroxelUVW;
       volumeFound = true;
 
       break;
@@ -354,15 +356,28 @@ vec3 evalVolumetricNEE(
   if (!volumeFound)
     return 0.0;
 
+  // Fork (2026-05-26): smooth falloff at the froxel-grid frustum edge.
+  // Without this, particles/decals/SAB-Path-B/PSR-diffuse that straddle
+  // the grid boundary show a sharp rectangular dark patch where the cache
+  // value cliffs from physical-bright to zero as the camera moves.
+  // Smoothstep over the last 10% of UVW converts the cliff to a soft fade.
+  const vec3 distToEdge = min(matchedVirtualFroxelUVW, vec3(1.0f) - matchedVirtualFroxelUVW);
+  const float edgeFalloff = smoothstep(0.0f, 0.1f, min(min(distToEdge.x, distToEdge.y), distToEdge.z));
+
+  // Artistic particle sun lighting scale
+  const float kConsumerMultiplier = volumeArgs.particleSunVisibilityScale;
+
   SphericalHarmonic sh = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(volumeFilteredRadianceY, volumeFilteredRadianceCoCg, physicalFroxelUVW);
   sh.hanningFilter(0.7f); // This was determined experimentally by looking at scenes with lots of geometry and sharp light shafts and tuning until ringing was minimized
+  vec3 result;
   if(phaseFunction)
   {
-    return sh.evaluateHenyeyGreenstein(direction, anisotropy);
+    result = sh.evaluateHenyeyGreenstein(direction, anisotropy);
   }
   else
   {
-    return sh.getIrradiance();
+    result = sh.getIrradiance();
   }
+  return result * kConsumerMultiplier * edgeFalloff;
 }
 #endif
