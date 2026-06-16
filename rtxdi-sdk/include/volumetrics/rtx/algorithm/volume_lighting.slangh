@@ -393,7 +393,7 @@ vec3 evalVolumetricNEE(
   // particles). Default 0.0 preserves the prior behavior; a small value
   // (~0.008 worked well for GTA IV) restores a little atmospheric tint on
   // smoke/dust without obvious false glow on shadowed surfaces.
-  const float kConsumerMultiplier = volumeArgs.volumetricConsumerGain;
+  const float kConsumerMultiplier = 0.008f;
 
   SphericalHarmonic sh = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(volumeFilteredRadianceY, volumeFilteredRadianceCoCg, physicalFroxelUVW);
   sh.hanningFilter(0.7f); // This was determined experimentally by looking at scenes with lots of geometry and sharp light shafts and tuning until ringing was minimized
