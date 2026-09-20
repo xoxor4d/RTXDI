@@ -23,6 +23,7 @@
 #include "rtx/algorithm/resolve.slangh"
 #include "rtx/algorithm/lighting.slangh"
 #include "rtx/algorithm/rtxdi/rtxdi.slangh"
+#include "rtx/pass/atmosphere/atmosphere_common.slangh"
 
 // Volume Integrate Helper Functions
 
@@ -80,8 +81,34 @@ bool evalNEE(
   // sanitization is done in the demodulate pass for non-volumetric lighting before feeding data to the
   // denoisers.
   radiance += sanitize(attenuatedRadiance, vec3(0.0f, 0.0f, 0.0f));
-  
+
   return true;
+}
+
+// Cloud-on-terrain shadow on the atmosphere sun/moons (real Remix distant lights)
+// in the volumetric froxel cache. Mirrors the surface fold in integrator_direct.slangh:
+// fold the voxel-grid cloud transmittance onto the flagged light's sampled radiance so
+// volumetric god-rays keep their cloud shadows. Needed because the sun/moon are now real
+// distant lights sampled by the volume NEE loop below — the bespoke
+// sampleAtmosphereSunLightVolume injection that used to apply cloud shadow here was
+// removed (it double-counted the sun into the cache; issue #35). fork — 2026-06-28.
+void applyAtmosphereCloudShadowVolume(inout RAB_LightSample lightSample, uint lightIdx, vec3 froxelWorldPosition)
+{
+  if (cb.skyMode != 1 || cb.atmosphereArgs.cloudVoxelShadowsEnable == 0u || lightIdx == RTXDI_INVALID_LIGHT_INDEX)
+  {
+    return;
+  }
+
+  const DecodedPolymorphicLight cloudShadowLight = decodePolymorphicLight(lights[lightIdx]);
+  if (!cloudShadowLight.atmosphereCloudShadowed)
+  {
+    return;
+  }
+
+  const vec3 dirToLight = normalize(lightSample.position - froxelWorldPosition);
+  const float cloudT = sampleCloudGroundShadow_OptionB(
+      froxelWorldPosition, dirToLight, cb.atmosphereArgs, cb.isZUp != 0);
+  lightSample.radiance *= pow(cloudT, cb.atmosphereArgs.cloudShadowFactorStrength);
 }
 
 // Volume Integrate Functions
@@ -187,6 +214,9 @@ void integrateVolume(
 
     if (lightSampleValid)
     {
+      // Fold cloud-on-terrain shadow onto the atmosphere sun/moons (flagged distant lights).
+      applyAtmosphereCloudShadowVolume(rabLightSample, currentVolumeReservoir.lightSample.lightIndex, volumeInteraction.position);
+
       if (evalNEE(
           radiance,
           rabLightSample, inverseSelectionPdf, sampledTransportPortalIndex,
@@ -234,7 +264,10 @@ void integrateVolume(
         // Note: lightType comes from the loop and is provided as a hint so that the compiler
         // can effectively unroll the loop and remove the switch from decodedPolymorphicLightSampleArea called within.
         RAB_LightSample rabLightSample = RAB_GetLightSampleWithTypeHint(offsetLightIndex, risSampleCoordinates, lightType, rabVolumeInteraction);
-        
+
+        // Fold cloud-on-terrain shadow onto the atmosphere sun/moons (flagged distant lights).
+        applyAtmosphereCloudShadowVolume(rabLightSample, offsetLightIndex, volumeInteraction.position);
+
         vec3 radiance = vec3(0.0f, 0.0f, 0.0f);
 
         if(evalNEE(
@@ -257,6 +290,77 @@ void integrateVolume(
     }
   }
   
+  // Atmosphere sun/moons are real Remix distant lights (since the directional-light
+  // graduation) and are already sampled by the volume NEE loop above, so the old
+  // bespoke sampleAtmosphereSunLightVolume injection that lived here was removed — it
+  // double-counted the sun into the froxel cache (once via NEE, once here), which made
+  // volumetric fog impossible to balance (issue #35). Cloud-on-terrain shadowing on the
+  // distant sun/moons is preserved via applyAtmosphereCloudShadowVolume, folded onto the
+  // NEE light sample above. fork — 2026-06-28.
+
+  // ----- Fork (2026-05-12): cloud-occluded sky-ambient hemisphere integration -----
+  //
+  // When skyMode == 1 (Numos) and cloudSkyAmbientStrength > 0,
+  // sample the sky-view LUT at a fixed set of upper-hemisphere directions,
+  // attenuate each by the cloud-sky-transmittance LUT, weight by HG phase,
+  // sum, and add to the per-frame radiance. Gives shadowed/overcast fog the
+  // tinted-by-the-rest-of-the-sky look that mere sun NEE cannot provide.
+  //
+  // Fixed direction set per frame (zenith + 5 mid-elevation at 30deg elevation,
+  // 72deg azimuth spacing) so the integrator's temporal EMA at line 302 sees
+  // a deterministic contribution -- no per-frame variance to filter.
+  //
+  // Gated on the RTX_OPTION default (0.0) so the feature ships off and the
+  // baseline volumetric appearance is bit-identical until the user opts in.
+  // See docs/superpowers/specs/2026-05-12-volumetric-sky-ambient-design.md.
+  if (cb.skyMode == 1 && cb.atmosphereArgs.cloudSkyAmbientStrength > 0.0f)
+  {
+    const uint kNumSkyAmbientDirs = 6u;
+    vec3 skyAmbientDirsYUp[kNumSkyAmbientDirs];
+    skyAmbientDirsYUp[0] = vec3( 0.0f,    1.0f,  0.0f   );  // zenith
+    skyAmbientDirsYUp[1] = vec3( 0.866f,  0.5f,  0.0f   );  // 30 elev, azim 0
+    skyAmbientDirsYUp[2] = vec3( 0.268f,  0.5f,  0.823f );  // 30 elev, azim 72
+    skyAmbientDirsYUp[3] = vec3(-0.701f,  0.5f,  0.509f );  // 30 elev, azim 144
+    skyAmbientDirsYUp[4] = vec3(-0.701f,  0.5f, -0.509f );  // 30 elev, azim 216
+    skyAmbientDirsYUp[5] = vec3( 0.268f,  0.5f, -0.823f );  // 30 elev, azim 288
+
+    // Upper hemisphere solid angle = 2*pi; equal-weight per direction.
+    const float kSolidAngleWeightPerDir = (2.0f * 3.14159265f) / float(kNumSkyAmbientDirs);
+    // Match the volumetric HG anisotropy hand-pinned at atmosphere_common.slangh:1108.
+    const float kVolumetricAnisotropy = 0.3f;
+
+    vec3 skyAmbientTotal = vec3(0.0f);
+    for (uint i = 0u; i < kNumSkyAmbientDirs; ++i)
+    {
+      vec3 dirYUp = skyAmbientDirsYUp[i];
+      // Map LUT-space (Y-up) sample direction into the volume's world frame for
+      // the phase-function angle. The LUT itself is always Y-up; the swap only
+      // affects how we relate the sampled direction to ray.direction.
+      vec3 dirWorld = (cb.isZUp != 0u) ? vec3(dirYUp.x, dirYUp.z, dirYUp.y) : dirYUp;
+
+      vec3 inscatter = sampleSkyAmbientForVolume(
+        dirYUp,
+        cb.atmosphereArgs,
+        AtmosphereSkyViewLut,
+        AtmosphereCloudSkyTransmittanceLut,
+        AtmosphereCloudNoise3DSampler);
+
+      float cosTheta = dot(-normalize(ray.direction), dirWorld);
+      float phase = hgPhase(cosTheta, kVolumetricAnisotropy);
+
+      skyAmbientTotal += inscatter * phase * kSolidAngleWeightPerDir;
+    }
+
+    vec3 skyAmbientContribution = skyAmbientTotal * cb.atmosphereArgs.cloudSkyAmbientStrength;
+    // Single SH entry with zenith as the dominant direction. The hemisphere is
+    // an extended source, not a directional one; using zenith preserves the
+    // "up-ish" character of the ambient term in the SH evaluation.
+    const vec3 zenithYUp = vec3(0.0f, 1.0f, 0.0f);
+    const vec3 zenithWorld = (cb.isZUp != 0u) ? vec3(0.0f, 0.0f, 1.0f) : zenithYUp;
+    const vec3 fireflyFilteredAmbient = fireflyFiltering(skyAmbientContribution, volumeArgs.froxelFireflyFilteringLuminanceThreshold);
+    radianceSH.addRadiance(fireflyFilteredAmbient, zenithWorld);
+  }
+
   // Accumulate the previous reprojected radiance with the current filtered sampled radiance
 
   const SphericalHarmonic newAccumulatedRadianceSH = HarmonicsHelpers::mix(oldRadianceSH, radianceSH, historyAgeWeight);

@@ -320,6 +320,7 @@ vec3 evalVolumetricNEE(
 
   bool volumeFound = false;
   vec3 physicalFroxelUVW;
+  vec3 matchedVirtualFroxelUVW = vec3(0.5f);
 
   for (uint i = 0; i < volumeArgs.numActiveFroxelVolumes; ++i)
   {
@@ -339,12 +340,13 @@ vec3 evalVolumetricNEE(
   #ifndef VOLUME_LIGHTING_NO_JITTER
     virtualFroxelUVW = calculateJitteredFroxelUvw(volumeArgs, virtualFroxelUVW);
   #endif
-    
+
     if (all(virtualFroxelUVW > 0.0f) && all(virtualFroxelUVW < 1.0f))
     {
       physicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(
         virtualFroxelUVW, froxelVolume,
         volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
+      matchedVirtualFroxelUVW = virtualFroxelUVW;
       volumeFound = true;
 
       break;
@@ -354,15 +356,56 @@ vec3 evalVolumetricNEE(
   if (!volumeFound)
     return 0.0;
 
+  // Fork (2026-05-26): smooth falloff at the froxel-grid frustum edge.
+  // Without this, particles/decals/SAB-Path-B/PSR-diffuse that straddle
+  // the grid boundary show a sharp rectangular dark patch where the cache
+  // value cliffs from physical-bright to zero as the camera moves.
+  // Smoothstep over the last 10% of UVW converts the cliff to a soft fade.
+  const vec3 distToEdge = min(matchedVirtualFroxelUVW, vec3(1.0f) - matchedVirtualFroxelUVW);
+  const float edgeFalloff = smoothstep(0.0f, 0.1f, min(min(distToEdge.x, distToEdge.y), distToEdge.z));
+
+  // Fork (2026-05-26): disables direct lighting on alpha-blended
+  // surfaces routed through the opacity lighting approximation.
+  //
+  // Background: resolve.slangh:158 routes particles and any surface
+  // flagged resolveModeForceOpacityLightingApprox into a cache-read
+  // shortcut INSTEAD of tracing the full direct light ray. The
+  // shortcut computes `albedo * cache * attenuation` with no BRDF,
+  // no cosine, and no /pi (despite an inline comment claiming a
+  // /4pi normalization that the code never performs).
+  //
+  // Combined with the cache being filled by per-froxel sun visibility
+  // rays cast from positions in the air, the shortcut produces false
+  // glow on alpha-blended decals/particles: air-froxels see the sun
+  // over local terrain that shadows the ground surfaces reading the
+  // cache, so the cache reports physical sun radiance regardless of
+  // actual visibility at the surface position.
+  //
+  // Setting this to 0 disables the shortcut entirely. Alpha-blended
+  // surfaces get their lighting from the regular direct + indirect
+  // passes, which is the correct path for decals that aren't supposed
+  // to receive Lambertian direct light (i.e. anything without a
+  // subsurface scattering material flag).
+  //
+  // Fork (issue #36): the consumer multiplier is now a user-tunable knob
+  // (rtx.volumetrics.volumetricConsumerGain) instead of a hardcoded 0.0, which
+  // left alpha-blended particles/decals unlit by the volumetric cache (black
+  // particles). Default 0.0 preserves the prior behavior; a small value
+  // (~0.008 worked well for GTA IV) restores a little atmospheric tint on
+  // smoke/dust without obvious false glow on shadowed surfaces.
+  const float kConsumerMultiplier = volumeArgs.volumetricConsumerGain;
+
   SphericalHarmonic sh = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(volumeFilteredRadianceY, volumeFilteredRadianceCoCg, physicalFroxelUVW);
   sh.hanningFilter(0.7f); // This was determined experimentally by looking at scenes with lots of geometry and sharp light shafts and tuning until ringing was minimized
+  vec3 result;
   if(phaseFunction)
   {
-    return sh.evaluateHenyeyGreenstein(direction, anisotropy);
+    result = sh.evaluateHenyeyGreenstein(direction, anisotropy);
   }
   else
   {
-    return sh.getIrradiance();
+    result = sh.getIrradiance();
   }
+  return result * kConsumerMultiplier * edgeFalloff;
 }
 #endif

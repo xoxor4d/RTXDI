@@ -187,8 +187,14 @@ void integrateVolumetricNEE(
     const float3 physicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(virtualFroxelUVW, currentFroxelVolume, volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
     
     const SphericalHarmonic sh = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(volumeFilteredRadianceY, volumeFilteredRadianceCoCg, physicalFroxelUVW);
-    
-    const float3 accumulatedRadianceSample = sh.evaluateHenyeyGreenstein(viewDir, volumeArgs.volumetricFogAnisotropy);
+
+    // Fog-only visibility gain. Volumetric fog needs more energy than the
+    // physical sun contribution gives at normal exposure to read as fog -- this
+    // is an artistic dial, not a unit-conversion fix. Lives here (consumer-side)
+    // so that other consumers of the same SH cache via
+    // volume_lighting.slangh::evalVolumetricNEE (decals/particles/PSR/SAB Path B)
+    // read honest physical values. Knob: rtx.volumetrics.fogSunVisibilityGain.
+    const float3 accumulatedRadianceSample = sh.evaluateHenyeyGreenstein(viewDir, volumeArgs.volumetricFogAnisotropy) * volumeArgs.fogSunVisibilityGain;
     
     const float3 inScattering = accumulatedRadianceSample + volumeArgs.multiScatteringEstimate;
     const float3 outScattering = volumeArgs.scatteringCoefficient * density;
