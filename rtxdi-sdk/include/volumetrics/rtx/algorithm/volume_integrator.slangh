@@ -313,6 +313,12 @@ void integrateVolume(
   // Gated on the RTX_OPTION default (0.0) so the feature ships off and the
   // baseline volumetric appearance is bit-identical until the user opts in.
   // See docs/superpowers/specs/2026-05-12-volumetric-sky-ambient-design.md.
+  //
+  // Fork (GTA IV): stored in VolumeSkyRadiance rather than added to radianceSH. The radiance
+  // cache is also read by particles and decals (evalVolumetricNEE), which then glowed with an
+  // unoccluded sky; the fog composite (integrateVolumetricNEE) adds this texture back the way it
+  // read the term from the cache.
+  vec3 skyRadiance = vec3(0.0f);
   if (cb.skyMode == 1 && cb.atmosphereArgs.cloudSkyAmbientStrength > 0.0f)
   {
     const uint kNumSkyAmbientDirs = 6u;
@@ -352,14 +358,13 @@ void integrateVolume(
     }
 
     vec3 skyAmbientContribution = skyAmbientTotal * cb.atmosphereArgs.cloudSkyAmbientStrength;
-    // Single SH entry with zenith as the dominant direction. The hemisphere is
+    // Treated as radiance arriving from the zenith by the fog composite: the hemisphere is
     // an extended source, not a directional one; using zenith preserves the
     // "up-ish" character of the ambient term in the SH evaluation.
-    const vec3 zenithYUp = vec3(0.0f, 1.0f, 0.0f);
-    const vec3 zenithWorld = (cb.isZUp != 0u) ? vec3(0.0f, 0.0f, 1.0f) : zenithYUp;
-    const vec3 fireflyFilteredAmbient = fireflyFiltering(skyAmbientContribution, volumeArgs.froxelFireflyFilteringLuminanceThreshold);
-    radianceSH.addRadiance(fireflyFilteredAmbient, zenithWorld);
+    skyRadiance = fireflyFiltering(skyAmbientContribution, volumeArgs.froxelFireflyFilteringLuminanceThreshold);
   }
+
+  VolumeSkyRadiance[froxelIndex + froxelVolumeOffset] = vec4(skyRadiance, 0.0f);
 
   // Accumulate the previous reprojected radiance with the current filtered sampled radiance
 

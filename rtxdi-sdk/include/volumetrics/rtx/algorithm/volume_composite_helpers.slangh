@@ -57,9 +57,13 @@ float getRayPortalIntersection(float3 origin, float3 direction, RayPortalHitInfo
   return -1.0;
 }
 
+// Fork (GTA IV): volumeSkyRadiance is the sky light the integrator keeps out of the radiance cache
+// (VolumeSkyRadiance in volume_integrator.slangh), read only when readSkyRadiance is set. skyZenith is the
+// world up direction it is treated as arriving from.
 void integrateVolumetricNEE(
   inout RNG randomState,
   Sampler3D<float> volumeFilteredRadianceAge, Sampler3D<float4> volumeFilteredRadianceY, Sampler3D<float2> volumeFilteredRadianceCoCg,
+  Sampler3D<float4> volumeSkyRadiance, const bool readSkyRadiance, const float3 skyZenith,
   const VolumeArgs volumeArgs, const float timeMS,
   const uint2 pixelCoordinate, float2 screenUV, bool primaryMiss,
   float3 startPosition, const float hitDistance, const float3 viewDir,
@@ -194,8 +198,17 @@ void integrateVolumetricNEE(
     // so that other consumers of the same SH cache via
     // volume_lighting.slangh::evalVolumetricNEE (decals/particles/PSR/SAB Path B)
     // read honest physical values. Knob: rtx.volumetrics.fogSunVisibilityGain.
-    const float3 accumulatedRadianceSample = sh.evaluateHenyeyGreenstein(viewDir, volumeArgs.volumetricFogAnisotropy) * volumeArgs.fogSunVisibilityGain;
-    
+    float3 accumulatedRadianceSample = sh.evaluateHenyeyGreenstein(viewDir, volumeArgs.volumetricFogAnisotropy) * volumeArgs.fogSunVisibilityGain;
+
+    // Fork (GTA IV): the sky light, read as it was when the integrator added it to the cache: radiance from
+    // the zenith in its own SH, through the same lobe and gain.
+    if (readSkyRadiance)
+    {
+      SphericalHarmonic skySh = SphericalHarmonic.create();
+      skySh.addRadiance(volumeSkyRadiance.SampleLevel(physicalFroxelUVW, 0).rgb, skyZenith);
+      accumulatedRadianceSample += skySh.evaluateHenyeyGreenstein(viewDir, volumeArgs.volumetricFogAnisotropy) * volumeArgs.fogSunVisibilityGain;
+    }
+
     const float3 inScattering = accumulatedRadianceSample + volumeArgs.multiScatteringEstimate;
     const float3 outScattering = volumeArgs.scatteringCoefficient * density;
   
@@ -218,4 +231,20 @@ void integrateVolumetricNEE(
   {
     accumulatedTransmittance *= calcVolumetricAttenuation(volumeArgs, camera, false, hitDistance - volumeArgs.froxelMaxDistance, previousTranslatedWorldPosition, viewDir);
   }
+}
+
+// Without the sky light (debug view). volumeFilteredRadianceY only fills the unread texture parameter.
+void integrateVolumetricNEE(
+  inout RNG randomState,
+  Sampler3D<float> volumeFilteredRadianceAge, Sampler3D<float4> volumeFilteredRadianceY, Sampler3D<float2> volumeFilteredRadianceCoCg,
+  const VolumeArgs volumeArgs, const float timeMS,
+  const uint2 pixelCoordinate, float2 screenUV, bool primaryMiss,
+  float3 startPosition, const float hitDistance, const float3 viewDir,
+  inout float3 preintegratedRadiance, inout float3 accumulatedTransmittance)
+{
+  integrateVolumetricNEE(
+    randomState, volumeFilteredRadianceAge, volumeFilteredRadianceY, volumeFilteredRadianceCoCg,
+    volumeFilteredRadianceY, false, float3(0.0f, 1.0f, 0.0f),
+    volumeArgs, timeMS, pixelCoordinate, screenUV, primaryMiss, startPosition, hitDistance, viewDir,
+    preintegratedRadiance, accumulatedTransmittance);
 }
