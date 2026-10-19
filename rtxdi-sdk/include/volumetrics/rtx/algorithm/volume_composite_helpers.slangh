@@ -59,11 +59,13 @@ float getRayPortalIntersection(float3 origin, float3 direction, RayPortalHitInfo
 
 // Fork (GTA IV): volumeSkyRadiance is the sky light the integrator keeps out of the radiance cache
 // (VolumeSkyRadiance in volume_integrator.slangh), read only when readSkyRadiance is set. skyZenith is the
-// world up direction it is treated as arriving from.
+// world up direction it is treated as arriving from. volumeSunRadianceY / CoCg hold the Numos sun's share of
+// the cache, accumulated alongside it; the fog sees that share scaled by fogSunScale.
 void integrateVolumetricNEE(
   inout RNG randomState,
   Sampler3D<float> volumeFilteredRadianceAge, Sampler3D<float4> volumeFilteredRadianceY, Sampler3D<float2> volumeFilteredRadianceCoCg,
   Sampler3D<float4> volumeSkyRadiance, const bool readSkyRadiance, const float3 skyZenith,
+  Sampler3D<float4> volumeSunRadianceY, Sampler3D<float2> volumeSunRadianceCoCg, const float fogSunScale,
   const VolumeArgs volumeArgs, const float timeMS,
   const uint2 pixelCoordinate, float2 screenUV, bool primaryMiss,
   float3 startPosition, const float hitDistance, const float3 viewDir,
@@ -190,7 +192,16 @@ void integrateVolumetricNEE(
     
     const float3 physicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(virtualFroxelUVW, currentFroxelVolume, volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
     
-    const SphericalHarmonic sh = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(volumeFilteredRadianceY, volumeFilteredRadianceCoCg, physicalFroxelUVW);
+    SphericalHarmonic sh = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(volumeFilteredRadianceY, volumeFilteredRadianceCoCg, physicalFroxelUVW);
+
+    // Fork (GTA IV): the sun's share rescaled for the fog alone. Both caches share every history weight, so
+    // removing it leaves exactly what the other lights accumulated.
+    if (fogSunScale != 1.0f)
+    {
+      const SphericalHarmonic sunSh = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(volumeSunRadianceY, volumeSunRadianceCoCg, physicalFroxelUVW);
+      sh.setY(sh.getY() + (fogSunScale - 1.0f) * sunSh.getY());
+      sh.setCoCg(sh.getCoCg() + (fogSunScale - 1.0f) * sunSh.getCoCg());
+    }
 
     // Fog-only visibility gain. Volumetric fog needs more energy than the
     // physical sun contribution gives at normal exposure to read as fog -- this
@@ -233,7 +244,7 @@ void integrateVolumetricNEE(
   }
 }
 
-// Without the sky light (debug view). volumeFilteredRadianceY only fills the unread texture parameter.
+// Without the sky light and with the full sun (debug view). The cache textures only fill the unread parameters.
 void integrateVolumetricNEE(
   inout RNG randomState,
   Sampler3D<float> volumeFilteredRadianceAge, Sampler3D<float4> volumeFilteredRadianceY, Sampler3D<float2> volumeFilteredRadianceCoCg,
@@ -244,7 +255,7 @@ void integrateVolumetricNEE(
 {
   integrateVolumetricNEE(
     randomState, volumeFilteredRadianceAge, volumeFilteredRadianceY, volumeFilteredRadianceCoCg,
-    volumeFilteredRadianceY, false, float3(0.0f, 1.0f, 0.0f),
+    volumeFilteredRadianceY, false, float3(0.0f, 1.0f, 0.0f), volumeFilteredRadianceY, volumeFilteredRadianceCoCg, 1.0f,
     volumeArgs, timeMS, pixelCoordinate, screenUV, primaryMiss, startPosition, hitDistance, viewDir,
     preintegratedRadiance, accumulatedTransmittance);
 }

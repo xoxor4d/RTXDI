@@ -111,6 +111,13 @@ void applyAtmosphereCloudShadowVolume(inout RAB_LightSample lightSample, uint li
   lightSample.radiance *= pow(cloudT, cb.atmosphereArgs.cloudShadowFactorStrength);
 }
 
+// Fork (GTA IV): the Numos sun. Its share of the cache is accumulated on its own as well, so the fog
+// composite can scale it (rtx.atmosphere.sunVolumetricScale) without changing what particles read.
+bool isAtmosphereSunLight(uint lightIdx)
+{
+  return lightIdx != RTXDI_INVALID_LIGHT_INDEX && decodePolymorphicLight(lights[lightIdx]).atmosphereSun;
+}
+
 // Volume Integrate Functions
 
 void integrateVolume(
@@ -129,6 +136,7 @@ void integrateVolume(
 
   const bool reprojectionValid = all(previousFroxelUVW > vec3(0.0f, 0.0f, 0.0f) && previousFroxelUVW < vec3(1.0f, 1.0f, 1.0f));
   SphericalHarmonic oldRadianceSH = SphericalHarmonic();
+  SphericalHarmonic oldSunRadianceSH = SphericalHarmonic();
   // Note: Default age is 0 when reprojection fails to reset history.
   float newHistoryAge = 0.0f;
   // Note: Default to 1.0 when reprojection fails to always favor new data coming in.
@@ -150,6 +158,7 @@ void integrateVolume(
     // these methods may require custom filtering logic). Additionally, the history age stored in the alpha channel is filtered too
     // which is fine as this should blend the histories of the contributions involved in the sample, which makes sense.
     oldRadianceSH = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(PrevAccumulatedRadianceY, PrevAccumulatedRadianceCoCg, physicalPreviousFroxelUVW);
+    oldSunRadianceSH = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(PrevSunRadianceY, PrevSunRadianceCoCg, physicalPreviousFroxelUVW);
     const float oldHistoryAge = PrevAccumulatedRadianceAge.SampleLevel(physicalPreviousFroxelUVW, 0) * volumeArgs.maxAccumulationFrames;
 
     // Note: Increment the sampled history age by 1 to represent this new sample.
@@ -173,6 +182,7 @@ void integrateVolume(
   // Perform NEE on the final Reservoir
 
   SphericalHarmonic radianceSH = SphericalHarmonic();
+  SphericalHarmonic sunRadianceSH = SphericalHarmonic();
   
   // Select and sample from a light for NEE via the Reservoir
   RAB_VolumeInteraction rabVolumeInteraction;
@@ -233,6 +243,10 @@ void integrateVolume(
     
         const float3 lightDir = normalize(rabLightSample.position - volumeInteraction.position);
         radianceSH.addRadiance(fireflyFilteredRadiance, lightDir);
+        if (isAtmosphereSunLight(currentVolumeReservoir.lightSample.lightIndex))
+        {
+          sunRadianceSH.addRadiance(fireflyFilteredRadiance, lightDir);
+        }
       }
     }
   }
@@ -285,6 +299,10 @@ void integrateVolume(
         
           const float3 lightDir = normalize(rabLightSample.position - volumeInteraction.position);
           radianceSH.addRadiance(fireflyFilteredRadiance, lightDir);
+          if (isAtmosphereSunLight(offsetLightIndex))
+          {
+            sunRadianceSH.addRadiance(fireflyFilteredRadiance, lightDir);
+          }
         }
       }
     }
@@ -369,10 +387,12 @@ void integrateVolume(
   // Accumulate the previous reprojected radiance with the current filtered sampled radiance
 
   const SphericalHarmonic newAccumulatedRadianceSH = HarmonicsHelpers::mix(oldRadianceSH, radianceSH, historyAgeWeight);
+  const SphericalHarmonic newAccumulatedSunRadianceSH = HarmonicsHelpers::mix(oldSunRadianceSH, sunRadianceSH, historyAgeWeight);
 
   // Store the current data
   
   HarmonicsHelpers::store3D<SphericalHarmonic>(newAccumulatedRadianceSH, AccumulatedRadianceY, AccumulatedRadianceCoCg, froxelIndex + froxelVolumeOffset);
+  HarmonicsHelpers::store3D<SphericalHarmonic>(newAccumulatedSunRadianceSH, SunRadianceY, SunRadianceCoCg, froxelIndex + froxelVolumeOffset);
   
   AccumulatedRadianceAge[froxelIndex + froxelVolumeOffset] = newHistoryAge / volumeArgs.maxAccumulationFrames;
 }
