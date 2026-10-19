@@ -341,6 +341,11 @@ vec3 evalVolumetricNEE(
     virtualFroxelUVW = calculateJitteredFroxelUvw(volumeArgs, virtualFroxelUVW);
   #endif
 
+    // Fork (GTA IV): past the far plane the last depth slice stands in for the rest of the view ray, so
+    // a surface beyond the grid (distant smoke against the haze) keeps the light of the air at the grid's
+    // edge instead of reading black.
+    virtualFroxelUVW.z = min(virtualFroxelUVW.z, 1.0f - 0.5f / float(volumeArgs.froxelDepthSlices));
+
     if (all(virtualFroxelUVW > 0.0f) && all(virtualFroxelUVW < 1.0f))
     {
       physicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(
@@ -361,7 +366,9 @@ vec3 evalVolumetricNEE(
   // the grid boundary show a sharp rectangular dark patch where the cache
   // value cliffs from physical-bright to zero as the camera moves.
   // Smoothstep over the last 10% of UVW converts the cliff to a soft fade.
-  const vec3 distToEdge = min(matchedVirtualFroxelUVW, vec3(1.0f) - matchedVirtualFroxelUVW);
+  // Fork (GTA IV): no fade toward the far plane, which the last slice now extends (see above).
+  vec3 distToEdge = min(matchedVirtualFroxelUVW, vec3(1.0f) - matchedVirtualFroxelUVW);
+  distToEdge.z = matchedVirtualFroxelUVW.z;
   const float edgeFalloff = smoothstep(0.0f, 0.1f, min(min(distToEdge.x, distToEdge.y), distToEdge.z));
 
   // Fork (2026-05-26): disables direct lighting on alpha-blended
